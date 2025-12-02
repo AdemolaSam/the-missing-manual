@@ -12,6 +12,7 @@ This demonstrates:
 """
 
 import os
+import asyncio
 from typing import Dict, Any
 from datetime import datetime
 
@@ -21,9 +22,8 @@ load_dotenv()
 
 # ADK imports - Using actual Google ADK framework
 from google.adk.agents import Agent, SequentialAgent, ParallelAgent
-from google.adk.sessions import InMemorySessionService
 from google.adk.runners import InMemoryRunner
-from google.genai.types import Content, Part
+from google.genai import types
 
 # Setup logging for observability
 import logging
@@ -40,7 +40,70 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY is required")
 
 
-# CUSTOM TOOLS
+# =============================================================================
+# RETRY LOGIC - Handle rate limiting with exponential backoff
+# =============================================================================
+
+async def retry_with_backoff(
+    coro,
+    max_retries: int = 5,
+    initial_delay: float = 1.0,
+    max_delay: float = 60.0
+):
+    """
+    Retry an async operation with exponential backoff on rate limit errors.
+    
+    Args:
+        coro: Async coroutine to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+        max_delay: Maximum delay cap in seconds
+        
+    Returns:
+        Result from the coroutine
+        
+    Raises:
+        Exception: If all retries are exhausted
+    """
+    delay = initial_delay
+    last_exception = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro
+        except Exception as e:
+            error_str = str(e)
+            last_exception = e
+            
+            # Check if it's a rate limit error (429, "Too Many Requests", or quota exceeded)
+            is_rate_limit = (
+                "429" in error_str or
+                "Too Many Requests" in error_str or
+                "RESOURCE_EXHAUSTED" in error_str or
+                "quota" in error_str.lower() or
+                "rate_limit" in error_str.lower()
+            )
+            
+            if not is_rate_limit or attempt == max_retries:
+                # Not a rate limit error, or we've exhausted retries
+                raise
+            
+            # Wait before retrying
+            logger.warning(
+                f"Rate limit encountered (attempt {attempt + 1}/{max_retries + 1}). "
+                f"Retrying in {delay:.1f} seconds... Error: {error_str[:100]}"
+            )
+            await asyncio.sleep(delay)
+            
+            # Exponential backoff with jitter
+            delay = min(delay * 2, max_delay)
+            # Add small random jitter to avoid thundering herd
+            delay += (delay * 0.1 * (asyncio.get_event_loop().time() % 1))
+
+
+# =============================================================================
+# CUSTOM TOOLS - Demonstrate tool integration
+# =============================================================================
 
 def get_current_time() -> dict:
     """Get current timestamp for documentation generation"""
@@ -50,8 +113,11 @@ def get_current_time() -> dict:
     }
 
 
+# =============================================================================
 # MEMORY BANK - Long-term memory for caching analyses
 # Demonstrates: Memory persistence across sessions
+# =============================================================================
+
 class DocumentlyMemoryBank:
     """
     Memory bank for storing and retrieving previous analyses
@@ -84,8 +150,10 @@ class DocumentlyMemoryBank:
         logger.info("Memory bank cleared")
 
 
+# =============================================================================
 # SPECIALIZED AGENTS - Each agent handles one source type
 # Demonstrates: Agent specialization and modularity
+# =============================================================================
 
 # Agent 1: Documentation Search Agent
 documentation_agent = Agent(
@@ -199,8 +267,10 @@ Use clear headings and concise language.""",
 )
 
 
+# =============================================================================
 # WORKFLOW ORCHESTRATION - Multi-Agent System
 # Demonstrates: Parallel + Sequential agent coordination
+# =============================================================================
 
 # Parallel Agent: Runs 4 specialist agents simultaneously
 # This is the "gathering" phase - all sources analyzed at once
@@ -228,18 +298,20 @@ root_agent = SequentialAgent(
 )
 
 
+# =============================================================================
 # DOCUMENTLY MAIN CLASS - Ties everything together
 # Demonstrates: Session management, memory, runner integration
+# =============================================================================
 
 class Documently:
     """
     Main Documently class integrating all components
     """
-    def __init__(self, app_name):
-        self.app_name = app_name
-        # Initialize runner (ADK's execution engine)
-        # InMemoryRunner automatically creates InMemorySessionService
-        self.runner = InMemoryRunner(agent=root_agent)
+    def __init__(self, app_name: str = "documently"):
+        # Initialize runner with explicit app_name (ADK's execution engine)
+        # Passing app_name ensures the runner and session lookups use the same application
+        # name and prevents mismatches when resolving sessions from the session service.
+        self.runner = InMemoryRunner(agent=root_agent, app_name=app_name)
         
         # Access the runner's session service
         self.session_service = self.runner.session_service
@@ -247,24 +319,26 @@ class Documently:
         # Initialize memory bank for caching
         self.memory = DocumentlyMemoryBank()
         
-        # User ID for session tracking
-        self.user_id = "documently_user"
+        # Store app name for session operations
+        self.app_name = app_name
         
         logger.info("Documently initialized with ADK framework")
     
     async def analyze_tool(
         self,
         tool_name: str,
-        use_cache: bool = True,
-        session_id: str = ""
+        user_id: str = "documently_user",
+        session_id: str | None = None,
+        use_cache: bool = True
     ) -> Dict[str, Any]:
         """
         Analyze a tool/framework and generate comprehensive guide
         
         Args:
             tool_name: Name of tool to analyze
-            use_cache: Whether to use cached results
+            user_id: User ID for session tracking
             session_id: Optional session ID for resuming
+            use_cache: Whether to use cached results
             
         Returns:
             Comprehensive analysis results
@@ -278,33 +352,44 @@ class Documently:
                 logger.info(f"Returning cached results for {tool_name}")
                 return cached
         
-        # Create or use existing session
+        # Generate session ID if not provided (ADK creates session automatically)
         if session_id is None:
-            session_id = f"session_{datetime.now().timestamp()}"
-            logger.info(f"Created new session: {session_id}")
+            session_id = f"session_{int(datetime.now().timestamp())}"
+            logger.info(f"Using new session: {session_id}")
         else:
             logger.info(f"Resuming session: {session_id}")
+
+        # Ensure a session exists in the session service before running.
+        # Some Runner implementations (including InMemoryRunner) expect the
+        # session to already exist; otherwise `run_async` will raise
+        # "Session not found". Create the session if it's missing.
+        existing_session = await self.session_service.get_session(
+            app_name=self.app_name, user_id=user_id, session_id=session_id
+        )
+        if not existing_session:
+            # create_session is an async method on the session service
+            await self.session_service.create_session(
+                app_name=self.app_name, user_id=user_id, session_id=session_id
+            )
         
-        # Prepare user message
-        user_message = Content(
+        # Prepare user message (correct ADK format)
+        user_message = types.Content(
             role="user",
-            parts=[Part(text=f"Analyze the tool/framework: {tool_name}")]
+            parts=[types.Part(text=f"Analyze the tool/framework: {tool_name}")]
         )
         
         try:
             # Run the agent (ADK handles all orchestration)
             logger.info("Executing parallel gathering agents...")
             
+            # Collect all events from the async generator
             final_text = ""
-            response = self.runner.run_async(
-                user_id=self.user_id,
+            async for event in self.runner.run_async(
+                user_id=user_id,
                 session_id=session_id,
                 new_message=user_message
-            )
-            
-            # Extract final response
-
-            async for event in response:
+            ):
+                # Extract text from events
                 if event.content and event.content.parts:
                     for part in event.content.parts:
                         if hasattr(part, 'text') and part.text:
@@ -312,8 +397,8 @@ class Documently:
             
             # Get session state to access all intermediate results
             session = await self.session_service.get_session(
-                app_name=self.runner.app_name,
-                user_id=self.user_id,
+                app_name=self.app_name,
+                user_id=user_id,
                 session_id=session_id
             )
             
@@ -334,10 +419,23 @@ class Documently:
             return results
             
         except Exception as e:
-            logger.error(f"Error during analysis: {str(e)}")
+            error_str = str(e)
+            logger.error(f"Error during analysis: {error_str}")
+            
+            # Provide helpful guidance for rate limit errors
+            if "429" in error_str or "Too Many Requests" in error_str or "quota" in error_str.lower():
+                logger.warning(
+                    "\n⏱️  RATE LIMIT REACHED\n"
+                    "The API quota has been exceeded. Try one of these options:\n"
+                    "  1. Wait a few minutes and retry\n"
+                    "  2. Use sequential mode to reduce concurrent requests:\n"
+                    "     python examples/analyze_tool.py --tool 'Mongoose' --sequential\n"
+                    "  3. Check your API quota at console.cloud.google.com\n"
+                )
+            
             raise
     
-    async def pause_session(self, session_id: str):
+    def pause_session(self, session_id: str):
         """
         Pause a session (ADK automatically persists state)
         
@@ -348,19 +446,20 @@ class Documently:
         # ADK's InMemorySessionService automatically maintains state
         # No explicit pause needed - session persists until cleared
     
-    async def get_session_state(self, session_id: str) -> Dict:
+    async def get_session_state(self, user_id: str, session_id: str) -> Dict:
         """
         Get current session state
         
         Args:
+            user_id: User ID
             session_id: Session ID
             
         Returns:
             Session state dict
         """
-        session = self.session_service.get_session(
-            app_name=self.runner.app_name,
-            user_id=self.user_id,
+        session = await self.session_service.get_session(
+            app_name=self.app_name,
+            user_id=user_id,
             session_id=session_id
         )
         
@@ -372,7 +471,9 @@ class Documently:
             return {}
 
 
+# =============================================================================
 # EXAMPLE USAGE
+# =============================================================================
 
 async def main():
     """Example usage of Documently with Google ADK"""

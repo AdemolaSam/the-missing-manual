@@ -1,6 +1,3 @@
-# Documently - AI Documentation Intelligence Agent
-# Built with Google ADK (Agent Development Kit)
-
 # Core - Google ADK Framework
 google-adk>=1.19.0
 
